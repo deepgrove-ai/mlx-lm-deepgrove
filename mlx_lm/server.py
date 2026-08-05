@@ -50,6 +50,30 @@ def get_system_fingerprint():
     return f"{__version__}-{mx.__version__}-{platform.platform()}-{gpu_arch}"
 
 
+def _load_model_registry(path: Optional[str]) -> Dict[str, Dict[str, Any]]:
+    """Load a JSON model registry mapping aliases to model configurations.
+
+    Each entry maps an alias to a dict that may contain:
+      - "model": model path or Hugging Face repo id (defaults to --model)
+      - "adapter": adapter path (optional)
+      - "draft_model": speculative decoding draft (optional)
+      - "flash_head": Maple only, override the output head (optional)
+      - "model_config": arbitrary overrides merged into the checkpoint config
+    """
+    if not path:
+        return {}
+    with open(path) as f:
+        registry = json.load(f)
+    if not isinstance(registry, dict):
+        raise ValueError(
+            "model registry must be a JSON object mapping aliases to model configs"
+        )
+    for alias, info in registry.items():
+        if not isinstance(info, dict):
+            raise ValueError(f"model registry entry '{alias}' must be an object")
+    return registry
+
+
 class ToolCallFormatter:
     def __init__(self, tool_parser, tools, streaming=False):
         self._idx = 0
@@ -298,12 +322,50 @@ class ModelProvider:
         self._adapter_map["default_model"] = self.cli_args.adapter_path
         self._draft_model_map["default_model"] = self.cli_args.draft_model
 
+        # Model aliases from --model-registry. The request `model` field accepts
+        # aliases, and each alias may carry per-model options (e.g. Maple's
+        # `use_flash_head`), so distinct variants can be served side by side.
+        self._model_registry = _load_model_registry(
+            getattr(self.cli_args, "model_registry", None)
+        )
+        for alias, info in self._model_registry.items():
+            resolved = info.get("model", self.cli_args.model)
+            self._model_map[alias] = resolved
+            self._adapter_map[resolved] = info.get(
+                "adapter", self.cli_args.adapter_path
+            )
+            self._draft_model_map[resolved] = info.get(
+                "draft_model", self.cli_args.draft_model
+            )
+
+        # Model config used by the currently loaded model, so that switching
+        # aliases that share a checkpoint but differ in options reloads.
+        self._loaded_model_config = None
+
         # Build the tokenizer config for later use in load
         self._tokenizer_config = {"trust_remote_code": cli_args.trust_remote_code}
         if cli_args.chat_template:
             self._tokenizer_config["chat_template"] = cli_args.chat_template
 
-    def _load(self, model_path, adapter_path=None, draft_model_path=None):
+    def _model_config_for(self, model_path: str) -> Dict[str, Any]:
+        """Build the per-model config for a requested model path or alias.
+
+        Registry entries may pin `flash_head` (Maple's approximate output head)
+        or pass arbitrary `model_config` overrides; `--flash-head` remains the
+        global fallback.
+        """
+        info = self._model_registry.get(model_path, {})
+        config = dict(info.get("model_config", {}))
+        flash_head = info.get("flash_head")
+        if flash_head is None:
+            flash_head = getattr(self.cli_args, "flash_head", None)
+        if flash_head is not None:
+            config["use_flash_head"] = flash_head
+        return config
+
+    def _load(
+        self, model_path, adapter_path=None, draft_model_path=None, model_config=None
+    ):
         if self.is_distributed and (
             adapter_path is not None or draft_model_path is not None
         ):
@@ -327,14 +389,11 @@ class ModelProvider:
                 trust_remote_code=self.cli_args.trust_remote_code,
             )
         else:
-            model_config = {}
-            if getattr(self.cli_args, "flash_head", None) is not None:
-                model_config["use_flash_head"] = self.cli_args.flash_head
             model, tokenizer = load(
                 model_path,
                 adapter_path=adapter_path,
                 tokenizer_config=self._tokenizer_config,
-                model_config=model_config,
+                model_config=model_config or {},
                 trust_remote_code=self.cli_args.trust_remote_code,
             )
 
@@ -365,19 +424,21 @@ class ModelProvider:
         self.tokenizer = tokenizer
         self.draft_model = draft_model
         self.is_batchable = is_batchable
+        self._loaded_model_config = model_config
 
     def load_default(self):
         if self._model_map["default_model"] is not None:
             self.load("default_model", None, "default_model")
 
     def load(self, model_path, adapter_path=None, draft_model_path=None):
+        model_config = self._model_config_for(model_path)
         model_path = self._model_map.get(model_path, model_path)
         adapter_path = self._adapter_map.get(model_path, adapter_path)
         draft_model_path = self._draft_model_map.get(draft_model_path, draft_model_path)
 
         model_key = (model_path, adapter_path, draft_model_path)
-        if self.model_key != model_key:
-            self._load(*model_key)
+        if self.model_key != model_key or self._loaded_model_config != model_config:
+            self._load(*model_key, model_config=model_config)
 
         return self.model, self.tokenizer
 
@@ -1650,6 +1711,21 @@ class APIHandler(BaseHTTPRequestHandler):
             for repo in downloaded_models
         ]
 
+        # List registry aliases so clients discover them by friendly name.
+        known_ids = {m["id"] for m in models}
+        registry = getattr(
+            self.response_generator.model_provider, "_model_registry", {}
+        )
+        for alias in registry:
+            if alias not in known_ids:
+                models.append(
+                    {
+                        "id": alias,
+                        "object": "model",
+                        "created": self.created,
+                    }
+                )
+
         if self.response_generator.cli_args.model:
             model_path = Path(self.response_generator.cli_args.model)
             if model_path.exists():
@@ -1729,6 +1805,14 @@ def main():
         "--adapter-path",
         type=str,
         help="Optional path for the trained adapter weights and config.",
+    )
+    parser.add_argument(
+        "--model-registry",
+        type=str,
+        default=None,
+        help="Path to a JSON file mapping model aliases to model paths and "
+        "per-model options, e.g. Maple's 'flash_head'. Aliases are served by "
+        "the /v1/models endpoint and accepted in the request 'model' field.",
     )
     parser.add_argument(
         "--host",

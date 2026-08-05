@@ -137,3 +137,8 @@ dmypy.json
 
 # .DS_Store files
 .DS_Store
+
+# Local model checkpoints
+/maple-2bit-mlx/
+/models/
+*.safetensors
