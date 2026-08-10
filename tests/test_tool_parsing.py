@@ -329,6 +329,83 @@ class TestToolParsing(unittest.TestCase):
         tool_calls = minimax_m2.parse_tool_call(test_case, None)
         self.assertEqual(expected, tool_calls)
 
+    def test_json_tools_back_to_back_objects(self):
+        # The model sometimes emits several JSON objects inside a single
+        # <tool_call> block. Previously this raised "Extra data" and the whole
+        # block was dropped; now each object becomes a tool call.
+        test_case = (
+            '{"name": "multiply", "arguments": {"a": 12234585, "b": 48838483920}}\n'
+            '{"name": "search", "arguments": {"query": "weather"}}'
+        )
+        tool_calls = json_tools.parse_tool_call(test_case, None)
+        expected = [
+            {
+                "name": "multiply",
+                "arguments": {"a": 12234585, "b": 48838483920},
+            },
+            {"name": "search", "arguments": {"query": "weather"}},
+        ]
+        self.assertEqual(tool_calls, expected)
+
+    def test_json_tools_trailing_prose(self):
+        test_case = (
+            '{"name": "multiply", "arguments": {"a": 12234585, "b": 48838483920}}\n'
+            "Let me now check the other numbers."
+        )
+        tool_calls = json_tools.parse_tool_call(test_case, None)
+        expected = {
+            "name": "multiply",
+            "arguments": {"a": 12234585, "b": 48838483920},
+        }
+        self.assertEqual(tool_calls, expected)
+
+    def test_json_tools_commas_between_objects(self):
+        test_case = (
+            '{"name": "multiply", "arguments": {"a": 1, "b": 2}},'
+            '{"name": "search", "arguments": {"query": "x"}}'
+        )
+        tool_calls = json_tools.parse_tool_call(test_case, None)
+        expected = [
+            {"name": "multiply", "arguments": {"a": 1, "b": 2}},
+            {"name": "search", "arguments": {"query": "x"}},
+        ]
+        self.assertEqual(tool_calls, expected)
+
+    def test_json_tools_truncated_raises(self):
+        with self.assertRaises(ValueError):
+            json_tools.parse_tool_call('{"name": "multiply", "arguments": {"a": 1', None)
+        with self.assertRaises(ValueError):
+            json_tools.parse_tool_call("", None)
+        with self.assertRaises(ValueError):
+            json_tools.parse_tool_call("not json at all", None)
+
+    def test_json_tools_malformed_first_object_skipped(self):
+        # The model sometimes glitches the first object (e.g. ""name"") and
+        # then repeats valid copies, re-opening <tool_call> each time. Recovery
+        # must skip the malformed span and the stray markers, keeping the
+        # valid repeated calls.
+        call = (
+            '{"name": "panorama_silence", "arguments": {"belief_updates": [], '
+            '"goal_updates": [], "memory_updates": [], "consensus_reached": false}}'
+        )
+        malformed = call.replace('"panorama_silence"', '""panorama_silence"')
+        test_case = (
+            malformed + "\n<tool_call>\n" + call + "\n<tool_call>\n" + call
+        )
+        tool_calls = json_tools.parse_tool_call(test_case, None)
+        self.assertEqual(len(tool_calls), 2)
+        for tc in tool_calls:
+            self.assertEqual(tc["name"], "panorama_silence")
+
+    def test_json_tools_arguments_subobject_not_confused(self):
+        # Forward-scan recovery must not emit an "arguments" sub-object as a
+        # tool call (it lacks a "name" key).
+        test_case = (
+            '{"name": ""broken", "arguments": {"a": 1}}\n<tool_call>\n{"a": 1}'
+        )
+        with self.assertRaises(ValueError):
+            json_tools.parse_tool_call(test_case, None)
+
 
 if __name__ == "__main__":
     unittest.main()

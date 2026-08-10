@@ -74,12 +74,21 @@ def _load_model_registry(path: Optional[str]) -> Dict[str, Dict[str, Any]]:
     return registry
 
 
+# Maximum accumulated characters for a single tool call block. If the model
+# stays in a "<tool_call>" block past this without emitting the closing tag it
+# has likely fallen into a repetition loop, so generation is aborted early.
+MAX_TOOL_CALL_CHARS = 2048
+
+
 class ToolCallFormatter:
     def __init__(self, tool_parser, tools, streaming=False):
         self._idx = 0
         self._tool_parser = tool_parser
         self._tools = tools
         self._streaming = streaming
+        self._parser_name = getattr(
+            self._tool_parser, "__module__", type(self._tool_parser).__name__
+        )
 
     def _format(self, tc):
         tc_id = tc.pop("id", None) or str(uuid.uuid4())
@@ -94,6 +103,40 @@ class ToolCallFormatter:
             self._idx += 1
         return out
 
+    @staticmethod
+    def _is_duplicate(a, b):
+        # Collapse consecutive calls to the same function with equivalent
+        # arguments. The model often repeats a call inside one block, once
+        # garbled (e.g. a typo'd arguments key) and once corrected. Calls are
+        # duplicates when the shared arguments keys are equal and the differing
+        # keys only rename values (garbled key) or one call is a strict
+        # superset of the other.
+        if a.get("function", {}).get("name") != b.get("function", {}).get("name"):
+            return False
+
+        def parse_args(call):
+            try:
+                return json.loads(call.get("function", {}).get("arguments"))
+            except (ValueError, TypeError):
+                return call.get("function", {}).get("arguments")
+
+        arg_a, arg_b = parse_args(a), parse_args(b)
+        if not isinstance(arg_a, dict) or not isinstance(arg_b, dict):
+            return arg_a == arg_b
+
+        keys_a, keys_b = set(arg_a), set(arg_b)
+        shared = keys_a & keys_b
+        if not shared:
+            return False
+        if any(arg_a[k] != arg_b[k] for k in shared):
+            return False
+
+        only_a = [arg_a[k] for k in keys_a - keys_b]
+        only_b = [arg_b[k] for k in keys_b - keys_a]
+        return not only_a or not only_b or sorted(only_a, key=repr) == sorted(
+            only_b, key=repr
+        )
+
     def __call__(self, tool_calls):
         if not tool_calls:
             return []
@@ -104,13 +147,43 @@ class ToolCallFormatter:
                 parsed = self._tool_parser(tool_text, self._tools)
             except (ValueError, json.JSONDecodeError) as e:
                 logging.warning(
-                    f"Failed to parse tool call ({type(e).__name__}: {e}) — "
-                    f"tool text was likely truncated mid-generation."
+                    "Failed to parse tool call (%s: %s) — tool text was likely "
+                    "truncated mid-generation.\n"
+                    "  parser: %s\n"
+                    "  tool_text (%d chars): %r",
+                    type(e).__name__,
+                    e,
+                    self._parser_name,
+                    len(tool_text),
+                    tool_text,
                 )
                 continue
+            logging.debug(
+                "Parsed tool call with %s: %r", self._parser_name, tool_text
+            )
             if not isinstance(parsed, list):
                 parsed = [parsed]
-            result.extend(self._format(tc) for tc in parsed)
+            for tc in parsed:
+                formatted = self._format(tc)
+                if result and self._is_duplicate(result[-1], formatted):
+                    # Prefer the more complete arguments; otherwise keep the
+                    # later call (the model's corrected intent).
+                    try:
+                        cur = json.loads(result[-1]["function"]["arguments"])
+                        new = json.loads(formatted["function"]["arguments"])
+                        cur_superset = isinstance(cur, dict) and not (
+                            set(new) - set(cur)
+                        )
+                        new_superset = isinstance(new, dict) and not (
+                            set(cur) - set(new)
+                        )
+                    except (ValueError, TypeError, KeyError):
+                        cur_superset = new_superset = False
+                    if cur_superset and not new_superset:
+                        continue
+                    result[-1] = formatted
+                    continue
+                result.append(formatted)
         return result
 
 
@@ -239,6 +312,8 @@ class GenerationContext:
 
     prompt: List[int]
     prompt_cache_count: int = -1
+
+    tool_call_start: Optional[str] = None
 
     _should_stop: bool = False
 
@@ -771,6 +846,7 @@ class ResponseGenerator:
                         initial_state=initial_state,
                         prompt=prompt,
                         prompt_cache_count=prompt_cache_count,
+                        tool_call_start=tokenizer.tool_call_start,
                     )
                     rqueue.put(ctx)
 
@@ -959,6 +1035,7 @@ class ResponseGenerator:
                 text_sm=text_sm,
                 initial_state=initial_state,
                 prompt=prompt,
+                tool_call_start=tokenizer.tool_call_start,
             )
             rqueue.put(ctx)
 
@@ -1462,6 +1539,7 @@ class APIHandler(BaseHTTPRequestHandler):
         reasoning_text = ""
         made_tool_call = False
         tool_text = ""
+        tool_text_too_long = False
         tool_calls = []
         text = ""
         tokens = []
@@ -1492,6 +1570,46 @@ class APIHandler(BaseHTTPRequestHandler):
                     reasoning_text += clean_text
                 elif current_state == "tool":
                     tool_text += clean_text
+                    if (
+                        ctx.tool_call_start
+                        and tool_text.count(ctx.tool_call_start) >= 2
+                    ):
+                        # The model re-opened <tool_call> instead of closing
+                        # with </tool_call>. Keep only the first complete call
+                        # and drop the rest of the degenerate block.
+                        kept = tool_text.split(ctx.tool_call_start, 1)[0].strip()
+                        logging.warning(
+                            "Tool call block re-opened with %r — the model is "
+                            "repeating tool calls instead of closing the block. "
+                            "Keeping the first call only.\n"
+                            "  kept (%d chars): %r\n"
+                            "  block (%d chars): %r",
+                            ctx.tool_call_start,
+                            len(kept),
+                            kept[-500:],
+                            len(tool_text),
+                            tool_text[-500:],
+                        )
+                        tool_text = kept
+                        finish_reason = "stop"
+                        break
+                    max_tool_call_chars = getattr(
+                        self.response_generator.cli_args,
+                        "max_tool_call_chars",
+                        MAX_TOOL_CALL_CHARS,
+                    )
+                    if len(tool_text) > max_tool_call_chars:
+                        logging.warning(
+                            "Tool call block grew to %d chars without a closing "
+                            "tag — aborting generation (possible repetition "
+                            "loop).\n  tail (%d chars): %r",
+                            len(tool_text),
+                            min(len(tool_text), 500),
+                            tool_text[-500:],
+                        )
+                        tool_text_too_long = True
+                        finish_reason = "stop"
+                        break
                 elif current_state == "normal":
                     if prev_state == "tool":
                         tool_calls.append(tool_text)
@@ -1528,9 +1646,11 @@ class APIHandler(BaseHTTPRequestHandler):
 
                 prev_state = current_state
 
-            if prev_state == "tool" and tool_text:
+            if prev_state == "tool" and tool_text and not tool_text_too_long:
                 tool_calls.append(tool_text)
                 made_tool_call = True
+            elif tool_text_too_long:
+                tool_text = ""
 
             if finish_reason == "stop" and made_tool_call:
                 finish_reason = "tool_calls"
@@ -1921,6 +2041,13 @@ def main():
         type=int,
         default=2048,
         help="Step size for prefill processing (default: 2048)",
+    )
+    parser.add_argument(
+        "--max-tool-call-chars",
+        type=int,
+        default=MAX_TOOL_CALL_CHARS,
+        help="Abort generation if a single tool call block exceeds this many "
+        "characters without a closing tag (guards against repetition loops)",
     )
     parser.add_argument(
         "--prompt-cache-size",
