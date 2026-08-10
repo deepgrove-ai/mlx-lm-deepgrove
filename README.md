@@ -92,6 +92,31 @@ Notes:
 - Not for production: the server implements only basic security checks.
 - See `mlx_lm/SERVER.md` for the full request/response reference.
 
+### Tool calling
+
+This branch hardens tool-call handling against Maple's flaky tool-call
+generation. Maple emits calls inside `<tool_call>…</tool_call>` blocks, and it
+frequently produces output that breaks naive parsing — blocks that never
+close, back-to-back JSON objects, repeated calls, or calls with garbled
+arguments keys. The server now:
+
+- recovers multiple back-to-back JSON objects inside a single block and
+  forward-scans past malformed spans (garbled objects, stray markers,
+  trailing prose); only objects with a string `"name"` key are emitted as
+  tool calls, so argument sub-objects are never confused for calls;
+- aborts generation when a block re-opens `<tool_call>` instead of closing
+  it (repetition loop) and keeps only the first complete call;
+- aborts blocks that grow past `--max-tool-call-chars` without a closing tag
+  (default 2048; `scripts/serve_maple.sh` uses 8192);
+- collapses consecutive calls to the same function with equivalent arguments
+  (exact, strict-superset, or renamed-key duplicates) into a single call,
+  preferring the more complete or corrected version.
+
+Each `tool_calls` entry carries `id`, `type: "function"`, and a
+`function` object with `name` and `arguments` (JSON string), matching the
+OpenAI chat completions schema. Smoke-tested end-to-end in
+`tests/test_server.py` and `tests/test_tool_parsing.py`.
+
 | chip | head | decode tok/s | prefill tok/s | peak |
 | --- | --- | --- | --- | --- |
 | M4 | exact (default) | 169 | 1075 | 6.51 GB |
