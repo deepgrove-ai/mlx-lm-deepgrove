@@ -4,20 +4,20 @@ Maple is a 20B-A1B ternary MoE with 24 layers, 256 experts, top-8, 512-token sli
 window on 3 of every 4 layers. Weights are 2-bit packed `{-α, 0, +α}`, one α per
 row. 
 
-This fork runs on the stock MLX build for portability. We intend to release a faster custom
-library in the coming days.
-
 ## Setup
 
-Requires Apple Silicon and [uv](https://docs.astral.sh/uv/).
+On an Apple Silicon Mac running macOS 26.2 or later, install
+[uv](https://docs.astral.sh/uv/) and run:
 
 ```sh
 git clone git@github.com:deepgrove-ai/mlx-lm-deepgrove.git
 cd mlx-lm-deepgrove
 ./setup.sh
 source .venv/bin/activate
-hf download deepgrove/maple-2bit-mlx --local-dir maple-2bit-mlx
+hf download deepgrove/maple-preview-2bit-mlx --local-dir maple-2bit-mlx
 ```
+
+`./setup.sh` installs everything needed. No Xcode or manual build is required.
 
 ## Run
 
@@ -39,8 +39,14 @@ python -m mlx_lm chat --model ./maple-2bit-mlx --trust-remote-code --max-tokens 
 | --- | --- | --- | --- | --- |
 | M4 | exact (default) | 169 | 1075 | 6.51 GB |
 | M4 | `--flash-head` | **218** | 1075 | 6.69 GB |
-| M5 Pro | exact (default) | 359 | 3773 | 6.73 GB |
-| M5 Pro | `--flash-head` | **395** | 3857 | 6.92 GB |
+| M5 Pro | exact (default) | 387 | 3511 | 6.96 GB |
+| M5 Pro | `--flash-head` | **477** | 3513 | 6.99 GB |
+
+M5 Pro: standard setup, 20-core GPU, 48 GB, macOS 26.4, MLX 0.32.0;
+battery power, default scheduling.
+512-token prompt / 256 generated, temp 1.0, top-p 0.95, 512 FlashHead probes;
+median of 6 runs. Peak measured separately per head, including model loading.
+M4 results are from the previous version.
 
 ## Convert
 

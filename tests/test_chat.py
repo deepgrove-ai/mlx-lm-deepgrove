@@ -2,7 +2,76 @@ import argparse
 import unittest
 from unittest.mock import MagicMock, patch
 
-from mlx_lm.chat import setup_arg_parser
+from mlx_lm.chat import _ChatSession, setup_arg_parser
+
+
+class ChatMLTokenizer:
+    eos_token_ids = {0}
+
+    def encode(self, text):
+        return [ord(c) for c in text.replace("<|im_end|>", "\0")]
+
+    def decode(self, tokens):
+        return "".join(map(chr, tokens)).replace("\0", "<|im_end|>")
+
+    def apply_chat_template(self, messages, add_generation_prompt=False):
+        text = "".join(
+            f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>\n" for m in messages
+        )
+        if add_generation_prompt:
+            text += "<|im_start|>assistant\n<think>\n"
+        return self.encode(text)
+
+
+class TestChatSession(unittest.TestCase):
+    def session(self):
+        with patch("mlx_lm.chat.make_prompt_cache", side_effect=lambda *a: [object()]):
+            return _ChatSession(None, ChatMLTokenizer(), system_prompt="Be concise.")
+
+    def test_next_turn_preserves_separator_and_system_prompt_once(self):
+        session = self.session()
+        tokenizer = session.tokenizer
+        first = session.prepare("Hello")
+        response = tokenizer.encode("Done.\n</think>\n\nHi.<|im_end|>")
+        session.finish(response)
+        cache = session.prompt_cache
+        second = session.prepare("Again")
+        self.assertIs(session.prompt_cache, cache)
+        self.assertTrue(tokenizer.decode(second).startswith("\n<|im_start|>user\n"))
+        complete = tokenizer.decode(first + response + second)
+        self.assertEqual(complete.count("<|im_start|>system\n"), 1)
+        self.assertIn("Hi.<|im_end|>\n<|im_start|>user\nAgain", complete)
+        self.assertEqual(session.cache_tokens, first + response + second)
+
+    def test_token_limit_closes_the_assistant_turn(self):
+        session = self.session()
+        session.prepare("Think")
+        session.finish(session.tokenizer.encode("unfinished"))
+        next_prompt = session.tokenizer.decode(session.prepare("Next"))
+        self.assertTrue(next_prompt.startswith("<|im_end|>\n<|im_start|>user\n"))
+        self.assertEqual(session.messages[2]["content"], "<think>\nunfinished")
+
+    def test_reset_discards_history_and_cache(self):
+        session = self.session()
+        first = session.prepare("Hello")
+        session.finish(session.tokenizer.encode("Hi.<|im_end|>"))
+        cache = session.prompt_cache
+        with patch("mlx_lm.chat.make_prompt_cache", return_value=[object()]):
+            session.reset()
+        self.assertIsNot(session.prompt_cache, cache)
+        self.assertEqual(session.prepare("Hello"), first)
+
+    def test_changed_template_prefix_rebuilds_cache(self):
+        session = self.session()
+        session.prepare("Hello")
+        session.finish(session.tokenizer.encode("Hi.<|im_end|>"))
+        session.messages[0]["content"] = "A revised system instruction."
+        cache = session.prompt_cache
+        with patch("mlx_lm.chat.make_prompt_cache", return_value=[object()]):
+            prompt = session.prepare("Next")
+        self.assertIsNot(session.prompt_cache, cache)
+        self.assertEqual(prompt, session.cache_tokens)
+        self.assertIn("A revised system instruction.", session.tokenizer.decode(prompt))
 
 
 class TestChat(unittest.TestCase):
@@ -74,7 +143,7 @@ class TestChat(unittest.TestCase):
         # Mock the model and tokenizer
         mock_model = MagicMock()
         mock_tokenizer = MagicMock()
-        mock_tokenizer.apply_chat_template.return_value = "processed_prompt"
+        mock_tokenizer.apply_chat_template.return_value = [1, 2, 3]
         mock_load.return_value = (mock_model, mock_tokenizer)
 
         # Mock prompt cache
@@ -84,6 +153,7 @@ class TestChat(unittest.TestCase):
         # Mock stream_generate to return some responses
         mock_response = MagicMock()
         mock_response.text = "Hello there!"
+        mock_response.token = 4
         mock_response.generation_tokens = 1
         mock_response.generation_tps = 1.0
         mock_response.prompt_tps = 1.0
@@ -133,7 +203,7 @@ class TestChat(unittest.TestCase):
         # Mock the model and tokenizer
         mock_model = MagicMock()
         mock_tokenizer = MagicMock()
-        mock_tokenizer.apply_chat_template.return_value = "processed_prompt"
+        mock_tokenizer.apply_chat_template.return_value = [1, 2, 3]
         mock_load.return_value = (mock_model, mock_tokenizer)
 
         # Mock prompt cache
@@ -143,6 +213,7 @@ class TestChat(unittest.TestCase):
         # Mock stream_generate to return some responses
         mock_response = MagicMock()
         mock_response.text = "Hello there!"
+        mock_response.token = 4
         mock_response.generation_tokens = 1
         mock_response.generation_tps = 1.0
         mock_response.prompt_tps = 1.0

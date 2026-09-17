@@ -1,2 +1,2 @@
-include requirements.txt
 recursive-include mlx_lm/ *.py
+recursive-include native/maple *.cpp *.py *.txt

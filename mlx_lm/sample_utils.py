@@ -49,7 +49,10 @@ def make_sampler(
     # Create sampler chain
     sampling_methods = []
     if top_p > 0 and top_p < 1.0:
-        sampling_methods.append(lambda x: apply_top_p(x, top_p))
+        top_p_impl = apply_top_p
+        if mx.__version__ == "0.32.0" and mx.metal.is_available():
+            from ._sampling_kernels import apply_top_p_fast as top_p_impl
+        sampling_methods.append(lambda x: top_p_impl(x, top_p))
     if min_p != 0.0:
         sampling_methods.append(lambda x: apply_min_p(x, min_p, min_tokens_to_keep))
     if xtc_probability > 0.0:

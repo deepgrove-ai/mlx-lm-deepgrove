@@ -19,6 +19,63 @@ DEFAULT_MAX_TOKENS = 256
 DEFAULT_MODEL = "mlx-community/Llama-3.2-3B-Instruct-4bit"
 
 
+class _ChatSession:
+    """Reuse KV state only for an exact prefix of the rendered conversation."""
+
+    def __init__(self, model, tokenizer, max_kv_size=None, system_prompt=None):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.max_kv_size = max_kv_size
+        self.system_prompt = system_prompt
+        self.reset()
+
+    def reset(self):
+        self.messages = (
+            [{"role": "system", "content": self.system_prompt}]
+            if self.system_prompt is not None
+            else []
+        )
+        self.cache_tokens = []
+        self.prompt_cache = make_prompt_cache(self.model, self.max_kv_size)
+
+    def prepare(self, query):
+        self.messages = self.messages + [{"role": "user", "content": query}]
+        # Preserve content prefilled by the template, such as Maple's <think>.
+        empty_assistant = self.tokenizer.apply_chat_template(
+            self.messages + [{"role": "assistant", "content": ""}],
+            add_generation_prompt=False,
+        )
+        full_prompt = self.tokenizer.apply_chat_template(
+            self.messages,
+            add_generation_prompt=True,
+        )
+        prefix = 0
+        for a, b in zip(empty_assistant, full_prompt):
+            if a != b:
+                break
+            prefix += 1
+        self.assistant_prefix = full_prompt[prefix:]
+
+        if full_prompt[: len(self.cache_tokens)] != self.cache_tokens:
+            self.prompt_cache = make_prompt_cache(self.model, self.max_kv_size)
+            self.cache_tokens = []
+        prompt = full_prompt[len(self.cache_tokens) :]
+        self.cache_tokens = list(full_prompt)
+        return prompt
+
+    def finish(self, tokens):
+        # generate_step's lookahead has evaluated every returned token,
+        # including EOS. The next template supplies any separator after EOS.
+        self.cache_tokens.extend(tokens)
+        content_tokens = (
+            tokens[:-1]
+            if tokens and tokens[-1] in self.tokenizer.eos_token_ids
+            else tokens
+        )
+        content = self.tokenizer.decode(self.assistant_prefix + content_tokens)
+        self.messages = self.messages + [{"role": "assistant", "content": content}]
+
+
 def setup_arg_parser():
     """Set up and return the argument parser."""
     parser = argparse.ArgumentParser(description="Chat with an LLM")
@@ -128,28 +185,22 @@ def main():
         )
 
     with ChatUI(args, rank=rank) as ui:
-        prompt_cache = make_prompt_cache(model, args.max_kv_size)
+        session = _ChatSession(model, tokenizer, args.max_kv_size, args.system_prompt)
         while True:
             query = ui.prompt()
             if query == "q":
                 ui.say_bye()
                 break
             if query == "r":
-                prompt_cache = make_prompt_cache(model, args.max_kv_size)
+                session.reset()
                 ui.say_reset()
                 continue
             if query == "h":
                 ui.say_help()
                 continue
-            messages = []
-            if args.system_prompt is not None:
-                messages.append({"role": "system", "content": args.system_prompt})
-            messages.append({"role": "user", "content": query})
-            prompt = tokenizer.apply_chat_template(
-                messages,
-                add_generation_prompt=True,
-            )
+            prompt = session.prepare(query)
             last_response = None
+            tokens = []
             for response in stream_generate(
                 model,
                 tokenizer,
@@ -164,10 +215,12 @@ def main():
                         tokenizer.encode("\n") + list(tokenizer.eos_token_ids)
                     ),
                 ),
-                prompt_cache=prompt_cache,
+                prompt_cache=session.prompt_cache,
             ):
                 ui.stream_token(response.text)
+                tokens.append(response.token)
                 last_response = response
+            session.finish(tokens)
             ui.end_turn(last_response)
 
 
