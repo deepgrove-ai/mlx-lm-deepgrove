@@ -164,10 +164,8 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
     _byte_decoder = None
 
     def __init__(self, tokenizer):
-        # Extract the tokens in a list from id to text
-        self.tokenmap = [None] * len(tokenizer.vocab)
-        for value, tokenid in tokenizer.vocab.items():
-            self.tokenmap[tokenid] = value
+        # Look up generated tokens without copying the entire vocabulary.
+        self._token_to_text = tokenizer.convert_ids_to_tokens
 
         self.reset()
 
@@ -202,7 +200,9 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
 
     def add_token(self, token):
         self.tokens.append(token)
-        v = self.tokenmap[token] if token < len(self.tokenmap) else "!"
+        v = self._token_to_text(token)
+        if v is None:
+            v = "!"
         self._unflushed += v
         text = self._decode_bytes(self._unflushed)
 

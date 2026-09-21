@@ -2,6 +2,7 @@
 
 import unittest
 from pathlib import Path
+from unittest.mock import Mock
 
 from huggingface_hub import snapshot_download
 
@@ -15,6 +16,36 @@ from mlx_lm.utils import load_tokenizer
 
 
 class TestTokenizers(unittest.TestCase):
+
+    def test_bpe_streams_keep_partial_utf8_and_state_independent(self):
+        tokenizer = Mock()
+        tokenizer.convert_ids_to_tokens.side_effect = {
+            0: "a",
+            1: "b",
+            2: "Ã",
+            3: "©",
+            4: "Ġ",
+        }.get
+        first = BPEStreamingDetokenizer(tokenizer)
+        second = BPEStreamingDetokenizer(tokenizer)
+        tokenizer.convert_ids_to_tokens.assert_not_called()
+
+        first.add_token(2)
+        self.assertEqual(first.last_segment, "")
+        second.add_token(0)
+        self.assertEqual(second.last_segment, "a")
+        first.add_token(3)
+        self.assertEqual(first.last_segment, "é")
+        self.assertEqual(first.tokens, [2, 3])
+        self.assertEqual(second.tokens, [0])
+
+        first.reset()
+        for token in (4, 1, 1000):
+            first.add_token(token)
+        first.finalize()
+        self.assertEqual(first.text, "b!")
+        self.assertEqual(first.tokens, [4, 1, 1000])
+        self.assertEqual(second.text, "a")
 
     def check_tokenizer(self, tokenizer):
         def check(tokens):
