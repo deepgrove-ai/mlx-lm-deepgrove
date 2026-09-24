@@ -153,3 +153,50 @@ list contains the following fields:
 
 - `id`: The Hugging Face repo id.
 - `created`: A time-stamp representing the model creation time.
+
+### Model registry
+
+A JSON **model registry** (`--model-registry path/to/registry.json`) registers
+friendly aliases that are accepted in the request `model` field and listed by
+`/v1/models`. This is how Maple-Preview is served with both output heads from a
+single process:
+
+```json
+{
+  "maple-preview": {
+    "model": "./maple-2bit-mlx",
+    "flash_head": false
+  },
+  "maple-preview-flash": {
+    "model": "./maple-2bit-mlx",
+    "flash_head": true
+  }
+}
+```
+
+(`model` may also be a Hugging Face repo id such as
+`deepgrove/maple-preview-2bit-mlx`, which is auto-downloaded on first load.)
+
+Each entry may set:
+
+- `model`: model path or Hugging Face repo id (defaults to `--model`).
+- `adapter`: optional adapter path.
+- `draft_model`: optional speculative-decoding draft.
+- `flash_head`: Maple only — enable (`true`) or disable (`false`) the
+  approximate FlashHead output layer. Falls back to the global `--flash-head`
+  flag when omitted.
+- `model_config`: arbitrary keys merged over the checkpoint config.
+
+Switching aliases that share a checkpoint but differ in `model_config`
+reloads the model with the new configuration.
+
+### Maple-Preview
+
+Maple is a reasoning model, so its `<think>`…`</think>` chain-of-thought is
+stripped from `content` and returned in the `reasoning` field of each choice
+(also streamed as `delta.reasoning`). Disable thinking with
+`--chat-template-args '{"enable_thinking": false}'`. The checkpoint ships its
+own `maple.py`, so start with `--trust-remote-code`.
+
+See the repo `README.md` for the Maple launcher (`scripts/serve_maple.sh`) and
+client examples.

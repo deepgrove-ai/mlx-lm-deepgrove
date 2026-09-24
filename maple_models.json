@@ -1,0 +1,10 @@
+{
+  "maple-preview": {
+    "model": "./maple-2bit-mlx",
+    "flash_head": false
+  },
+  "maple-preview-flash": {
+    "model": "./maple-2bit-mlx",
+    "flash_head": true
+  }
+}

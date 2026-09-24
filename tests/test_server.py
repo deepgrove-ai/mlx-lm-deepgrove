@@ -19,6 +19,7 @@ from mlx_lm.server import (
     SamplingArguments,
     _make_sampler,
 )
+from mlx_lm.tool_parsers import json_tools
 from mlx_lm.utils import load
 
 
@@ -56,6 +57,7 @@ class DummyModelProvider:
                 "prompt_cache_bytes": 1 << 63,
                 "prompt_cache_total_bytes": None,
                 "allowed_origins": ["*"],
+                "max_tool_call_chars": 2048,
             },
         )
 
@@ -320,6 +322,303 @@ class TestServer(unittest.TestCase):
         response_body = response.text
         self.assertIn("id", response_body)
         self.assertIn("choices", response_body)
+
+    def test_tool_call_loop_guard(self):
+        # When the model stays inside a <tool_call> block without closing it
+        # (repetition loop), generation must abort once the block exceeds
+        # max_tool_call_chars instead of running to max_tokens.
+        url = f"http://localhost:{self.port}/v1/chat/completions"
+        sm = TextStateMachine(
+            {
+                "normal": [("<tool_call>", "tool")],
+                "tool": [("</tool_call>", "normal")],
+            }
+        )
+
+        class FakeCtx:
+            has_tool_calling = True
+            has_thinking = False
+            text_sm = sm
+            initial_state = "normal"
+            prompt = "x"
+            prompt_cache_count = -1
+
+            def __init__(self):
+                # Instance attributes (like GenerationContext fields) so the
+                # function isn't bound to the instance.
+                self.tool_parser = json_tools.parse_tool_call
+                self.tool_call_start = "<tool_call>"
+
+            def stop(self):
+                pass
+
+        consumed = []
+
+        def fake_chunks():
+            yield Response("<tool_call>", 0, 0.0, None, ())
+            for i in range(200):
+                consumed.append(i)
+                yield Response("x" * 100, 0, 0.0, None, ())
+            yield Response("", 0, 0.0, "length", ())
+
+        def fake_generate(request, generation_args, progress_callback=None):
+            return FakeCtx(), fake_chunks()
+
+        original_generate = self.response_generator.generate
+        original_threshold = self.response_generator.cli_args.max_tool_call_chars
+        self.response_generator.generate = fake_generate
+        self.response_generator.cli_args.max_tool_call_chars = 64
+        try:
+            response = requests.post(
+                url,
+                json={
+                    "model": "chat_model",
+                    "max_tokens": 100,
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "f",
+                                "parameters": {"type": "object"},
+                            },
+                        }
+                    ],
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+            )
+            response_body = json.loads(response.text)
+            message = response_body["choices"][0]["message"]
+            self.assertEqual(response_body["choices"][0]["finish_reason"], "stop")
+            self.assertNotIn("tool_calls", message)
+            # Generation was aborted long before the canned stream ended.
+            self.assertLess(len(consumed), 200)
+        finally:
+            self.response_generator.generate = original_generate
+            self.response_generator.cli_args.max_tool_call_chars = original_threshold
+
+    def test_tool_call_repetition_aborts(self):
+        # If the model emits a valid tool call and then re-opens the block with
+        # <tool_call> instead of closing it (repetition loop), generation must
+        # abort and recover the repeated call exactly once.
+        url = f"http://localhost:{self.port}/v1/chat/completions"
+        sm = TextStateMachine(
+            {
+                "normal": [("<tool_call>", "tool")],
+                "tool": [("</tool_call>", "normal")],
+            }
+        )
+        call = '{"name": "f", "arguments": {"a": 1}}'
+
+        class FakeCtx:
+            has_tool_calling = True
+            has_thinking = False
+            text_sm = sm
+            initial_state = "normal"
+            prompt = "x"
+            prompt_cache_count = -1
+
+            def __init__(self):
+                # Instance attributes (like GenerationContext fields) so the
+                # function isn't bound to the instance.
+                self.tool_parser = json_tools.parse_tool_call
+                self.tool_call_start = "<tool_call>"
+
+            def stop(self):
+                pass
+
+        consumed = []
+
+        def fake_chunks():
+            # <tool_call> then a valid call, then re-open marker, valid call,
+            # re-open marker -> repetition detected at the 2nd marker.
+            yield Response("<tool_call>", 0, 0.0, None, ())
+            for part in [call, "<tool_call>", call, "<tool_call>"]:
+                consumed.append(part)
+                yield Response(part, 0, 0.0, None, ())
+            yield Response("", 0, 0.0, "length", ())
+
+        def fake_generate(request, generation_args, progress_callback=None):
+            return FakeCtx(), fake_chunks()
+
+        original_generate = self.response_generator.generate
+        self.response_generator.generate = fake_generate
+        try:
+            response = requests.post(
+                url,
+                json={
+                    "model": "chat_model",
+                    "max_tokens": 100,
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "f",
+                                "parameters": {"type": "object"},
+                            },
+                        }
+                    ],
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+            )
+            response_body = json.loads(response.text)
+            message = response_body["choices"][0]["message"]
+            self.assertEqual(response_body["choices"][0]["finish_reason"], "tool_calls")
+            self.assertEqual(len(message["tool_calls"]), 1)
+            self.assertEqual(message["tool_calls"][0]["function"]["name"], "f")
+            # Aborted on the 2nd re-open marker, far short of the canned end.
+            self.assertLessEqual(len(consumed), 4)
+        finally:
+            self.response_generator.generate = original_generate
+
+    def test_tool_call_reopened_keeps_first(self):
+        # A re-opened block containing calls to different functions must keep
+        # only the first call, not emit both.
+        url = f"http://localhost:{self.port}/v1/chat/completions"
+        sm = TextStateMachine(
+            {
+                "normal": [("<tool_call>", "tool")],
+                "tool": [("</tool_call>", "normal")],
+            }
+        )
+        first = '{"name": "get_skill", "arguments": {"skill_id": "objektvision-helper", "state": {}}}'
+        second = '{"name": "list_skills", "arguments": {"state": {}}}'
+
+        class FakeCtx:
+            has_tool_calling = True
+            has_thinking = False
+            text_sm = sm
+            initial_state = "normal"
+            prompt = "x"
+            prompt_cache_count = -1
+
+            def __init__(self):
+                self.tool_parser = json_tools.parse_tool_call
+                self.tool_call_start = "<tool_call>"
+
+            def stop(self):
+                pass
+
+        def fake_chunks():
+            yield Response("<tool_call>", 0, 0.0, None, ())
+            yield Response(first, 0, 0.0, None, ())
+            yield Response("<tool_call>", 0, 0.0, None, ())
+            yield Response(second, 0, 0.0, None, ())
+            yield Response("<tool_call>", 0, 0.0, None, ())
+            yield Response("", 0, 0.0, "length", ())
+
+        def fake_generate(request, generation_args, progress_callback=None):
+            return FakeCtx(), fake_chunks()
+
+        original_generate = self.response_generator.generate
+        self.response_generator.generate = fake_generate
+        try:
+            response = requests.post(
+                url,
+                json={
+                    "model": "chat_model",
+                    "max_tokens": 100,
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "get_skill",
+                                "parameters": {"type": "object"},
+                            },
+                        },
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "list_skills",
+                                "parameters": {"type": "object"},
+                            },
+                        },
+                    ],
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+            )
+            response_body = json.loads(response.text)
+            message = response_body["choices"][0]["message"]
+            self.assertEqual(response_body["choices"][0]["finish_reason"], "tool_calls")
+            tool_calls = message["tool_calls"]
+            self.assertEqual(len(tool_calls), 1)
+            self.assertEqual(tool_calls[0]["function"]["name"], "get_skill")
+        finally:
+            self.response_generator.generate = original_generate
+
+    def test_tool_call_semantic_duplicate_collapsed(self):
+        # The model can emit the same call twice in one block, once with a
+        # garbled arguments key and once corrected. Both must collapse to a
+        # single call, keeping the corrected (later) version.
+        url = f"http://localhost:{self.port}/v1/chat/completions"
+        sm = TextStateMachine(
+            {
+                "normal": [("<tool_call>", "tool")],
+                "tool": [("</tool_call>", "normal")],
+            }
+        )
+        garbled = (
+            '{"name": "f", "arguments": {"path": "smoke-test-output.md", '
+            '"content": "# Smoke test", "state Constructs": {}}}'
+        )
+        corrected = (
+            '{"name": "f", "arguments": {"path": "smoke-test-output.md", '
+            '"content": "# Smoke test", "state": {}}}'
+        )
+
+        class FakeCtx:
+            has_tool_calling = True
+            has_thinking = False
+            text_sm = sm
+            initial_state = "normal"
+            prompt = "x"
+            prompt_cache_count = -1
+
+            def __init__(self):
+                self.tool_parser = json_tools.parse_tool_call
+                self.tool_call_start = "<tool_call>"
+
+            def stop(self):
+                pass
+
+        def fake_chunks():
+            # One block, two back-to-back objects (the "Extra data" case).
+            yield Response("<tool_call>", 0, 0.0, None, ())
+            yield Response(garbled + corrected, 0, 0.0, None, ())
+            yield Response("</tool_call>", 0, 0.0, None, ())
+
+        def fake_generate(request, generation_args, progress_callback=None):
+            return FakeCtx(), fake_chunks()
+
+        original_generate = self.response_generator.generate
+        self.response_generator.generate = fake_generate
+        try:
+            response = requests.post(
+                url,
+                json={
+                    "model": "chat_model",
+                    "max_tokens": 100,
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "f",
+                                "parameters": {"type": "object"},
+                            },
+                        }
+                    ],
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+            )
+            response_body = json.loads(response.text)
+            message = response_body["choices"][0]["message"]
+            self.assertEqual(response_body["choices"][0]["finish_reason"], "tool_calls")
+            tool_calls = message["tool_calls"]
+            self.assertEqual(len(tool_calls), 1)
+            arguments = json.loads(tool_calls[0]["function"]["arguments"])
+            self.assertIn("state", arguments)
+            self.assertNotIn("state Constructs", arguments)
+        finally:
+            self.response_generator.generate = original_generate
 
     def test_make_state_machine_empty_tool_call_end(self):
         class FakeTokenizer:
